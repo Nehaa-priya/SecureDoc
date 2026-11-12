@@ -4,6 +4,7 @@ logger = logging.getLogger(__name__)
 import os
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 from uuid import uuid4
 
