@@ -1,7 +1,13 @@
 
 import os
+import time
+import urllib.request
 from pathlib import Path
 from uuid import uuid4
+
+import cloudinary
+import cloudinary.uploader
+import cloudinary.utils
 
 from fastapi import (
     FastAPI,
@@ -11,7 +17,7 @@ from fastapi import (
     File
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
@@ -25,8 +31,6 @@ from auth import (
     get_current_user,
     get_current_admin
 )
-
-import models
 
 
 # -------------------------------
@@ -43,6 +47,20 @@ Base.metadata.create_all(bind=engine)
 
 
 # -------------------------------
+# Cloudinary Configuration
+# -------------------------------
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
+
+MAX_FILE_SIZE = 5 * 1024 * 1024
+
+
+# -------------------------------
 # CORS Configuration
 # -------------------------------
 
@@ -56,21 +74,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
-
-
-# -------------------------------
-# File Storage Configuration
-# -------------------------------
-
-MAX_FILE_SIZE = 5 * 1024 * 1024
-
-UPLOAD_DIR = (
-    Path(__file__).resolve().parent
-    / "storage"
-    / "documents"
-)
-
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # -------------------------------
@@ -181,7 +184,7 @@ def get_my_profile(
 
 
 # -------------------------------
-# Upload Document
+# Upload Document to Cloudinary
 # -------------------------------
 
 @app.post("/documents/upload")
@@ -233,19 +236,38 @@ async def upload_document(
             detail="Invalid file content"
         )
 
-    stored_name = f"{uuid4().hex}{extension}"
-    file_path = UPLOAD_DIR / stored_name
+    if not all([
+        os.getenv("CLOUDINARY_CLOUD_NAME"),
+        os.getenv("CLOUDINARY_API_KEY"),
+        os.getenv("CLOUDINARY_API_SECRET")
+    ]):
+        raise HTTPException(
+            status_code=500,
+            detail="Cloud storage is not configured"
+        )
 
-    document = Document(
-        filename=original_name,
-        stored_filename=stored_name,
-        content_type=expected_type,
-        file_size=len(content),
-        owner_id=current_user.id
-    )
+    public_id = f"securedoc/{uuid4().hex}{extension}"
+    uploaded = False
 
     try:
-        file_path.write_bytes(content)
+        result = cloudinary.uploader.upload(
+            content,
+            public_id=public_id,
+            resource_type="raw",
+            type="authenticated",
+            overwrite=False
+        )
+
+        stored_name = result["public_id"]
+        uploaded = True
+
+        document = Document(
+            filename=original_name,
+            stored_filename=stored_name,
+            content_type=expected_type,
+            file_size=len(content),
+            owner_id=current_user.id
+        )
 
         db.add(document)
         db.flush()
@@ -255,7 +277,7 @@ async def upload_document(
             action="DOCUMENT_UPLOADED",
             resource_type="document",
             resource_id=document.id,
-            details="Document uploaded successfully"
+            details="Document uploaded to private Cloudinary storage"
         ))
 
         db.commit()
@@ -264,12 +286,20 @@ async def upload_document(
     except Exception:
         db.rollback()
 
-        if file_path.exists():
-            file_path.unlink()
+        if uploaded:
+            try:
+                cloudinary.uploader.destroy(
+                    stored_name,
+                    resource_type="raw",
+                    type="authenticated",
+                    invalidate=True
+                )
+            except Exception:
+                pass
 
         raise HTTPException(
             status_code=500,
-            detail="Document upload failed"
+            detail="Document upload failed. Check Cloudinary configuration."
         )
 
     return {
@@ -328,12 +358,44 @@ def download_document(
             detail="Document not found"
         )
 
-    file_path = UPLOAD_DIR / document.stored_filename
+    
 
-    if not file_path.is_file():
+    try:
+        extension = Path(document.filename).suffix.lower().lstrip(".")
+
+        public_id = document.stored_filename.removesuffix(
+            "." + extension
+        )
+
+        download_url = cloudinary.utils.private_download_url(
+            public_id,
+            extension,
+            resource_type="raw",
+            type="authenticated",
+            attachment=True,
+            expires_at=int(time.time()) + 300
+        )
+
+        request = urllib.request.Request(
+            download_url,
+            headers={"User-Agent": "SecureDoc"}
+        )
+
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content = response.read(MAX_FILE_SIZE + 1)
+
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=502,
+                detail="Stored file exceeds the allowed size"
+            )
+
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(
-            status_code=404,
-            detail="Stored file not found"
+            status_code=502,
+            detail="Could not retrieve the document from secure storage"
         )
 
     db.add(AuditLog(
@@ -341,15 +403,20 @@ def download_document(
         action="DOCUMENT_DOWNLOADED",
         resource_type="document",
         resource_id=document.id,
-        details="Document downloaded"
+        details="Document downloaded from private Cloudinary storage"
     ))
 
     db.commit()
 
-    return FileResponse(
-        path=file_path,
+    safe_filename = document.filename.replace('"', "")
+
+    return Response(
+        content=content,
         media_type=document.content_type,
-        filename=document.filename
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Content-Length": str(len(content))
+        }
     )
 
 
@@ -374,21 +441,34 @@ def delete_document(
             detail="Document not found"
         )
 
-    file_path = UPLOAD_DIR / document.stored_filename
+    try:
+        result = cloudinary.uploader.destroy(
+            document.stored_filename,
+            resource_type="raw",
+            type="authenticated",
+            invalidate=True
+        )
 
-    db.add(AuditLog(
-        actor_id=current_user.id,
-        action="DOCUMENT_DELETED",
-        resource_type="document",
-        resource_id=document.id,
-        details="Document deleted"
-    ))
+        if result.get("result") not in ("ok", "not found"):
+            raise Exception("Cloudinary deletion failed")
 
-    db.delete(document)
-    db.commit()
+        db.add(AuditLog(
+            actor_id=current_user.id,
+            action="DOCUMENT_DELETED",
+            resource_type="document",
+            resource_id=document.id,
+            details="Document deleted from private Cloudinary storage"
+        ))
 
-    if file_path.is_file():
-        file_path.unlink()
+        db.delete(document)
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Document deletion failed"
+        )
 
     return {
         "message": "Document deleted successfully",
