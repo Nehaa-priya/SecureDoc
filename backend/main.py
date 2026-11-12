@@ -397,7 +397,21 @@ def download_document(
 
     except HTTPException:
         raise
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        logger.error(
+            "Cloudinary download HTTP error: %s - %s",
+            e.code,
+            error_body[:1000]
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Cloudinary rejected the download request. Check backend logs."
+        )
+
     except Exception:
+        logger.exception("Unexpected Cloudinary download error")
         raise HTTPException(
             status_code=502,
             detail="Could not retrieve the document from secure storage"
