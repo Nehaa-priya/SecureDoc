@@ -1,3 +1,23 @@
+
+import os
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    UploadFile,
+    File
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+
+from database import get_db, engine, Base
+from models import User, Document, AuditLog
+from schemas import UserRegister, UserResponse
 from auth import (
     hash_password,
     verify_password,
@@ -5,39 +25,57 @@ from auth import (
     get_current_user,
     get_current_admin
 )
-from fastapi.responses import FileResponse
-from pathlib import Path
-from uuid import uuid4
-from fastapi import UploadFile, File
-from models import Document, AuditLog
-from fastapi import FastAPI
-from fastapi.security import OAuth2PasswordRequestForm
-from fastapi import Depends, HTTPException
-from sqlalchemy.orm import Session
-from database import get_db
-from models import User
-from schemas import UserRegister, UserLogin, UserResponse
-from database import engine, Base
+
 import models
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+
+
+# -------------------------------
+# Application Configuration
+# -------------------------------
 
 app = FastAPI(
-    title="SecureDoc API",
-    description="Secure document management application",
+    title="SecureDoc - Secure Document Management",
+    description="A secure document management platform with authentication, role-based access control, and audit logging.",
     version="1.0.0"
 )
+
 Base.metadata.create_all(bind=engine)
 
-# Allow our local React frontend to communicate with the API
+
+# -------------------------------
+# CORS Configuration
+# -------------------------------
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=os.getenv(
+        "FRONTEND_URL",
+        "http://localhost:5173"
+    ).split(","),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
+
+# -------------------------------
+# File Storage Configuration
+# -------------------------------
+
+MAX_FILE_SIZE = 5 * 1024 * 1024
+
+UPLOAD_DIR = (
+    Path(__file__).resolve().parent
+    / "storage"
+    / "documents"
+)
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# -------------------------------
+# Home and Health Endpoints
+# -------------------------------
 
 @app.get("/")
 def home():
@@ -53,9 +91,17 @@ def health_check():
         "status": "healthy",
         "application": "SecureDoc"
     }
-@app.post("/register", response_model=UserResponse)
-def register_user(data: UserRegister, db: Session = Depends(get_db)):
 
+
+# -------------------------------
+# User Registration
+# -------------------------------
+
+@app.post("/register", response_model=UserResponse)
+def register_user(
+    data: UserRegister,
+    db: Session = Depends(get_db)
+):
     existing_user = db.query(User).filter(
         User.email == data.email
     ).first()
@@ -78,6 +124,11 @@ def register_user(data: UserRegister, db: Session = Depends(get_db)):
 
     return new_user
 
+
+# -------------------------------
+# User Login
+# -------------------------------
+
 @app.post("/login")
 def login_user(
     form_data: OAuth2PasswordRequestForm = Depends(),
@@ -88,7 +139,8 @@ def login_user(
     ).first()
 
     if not user or not verify_password(
-        form_data.password, user.hashed_password
+        form_data.password,
+        user.hashed_password
     ):
         raise HTTPException(
             status_code=401,
@@ -110,6 +162,12 @@ def login_user(
         "access_token": access_token,
         "token_type": "bearer"
     }
+
+
+# -------------------------------
+# Current User Profile
+# -------------------------------
+
 @app.get("/me")
 def get_my_profile(
     current_user: User = Depends(get_current_user)
@@ -121,12 +179,10 @@ def get_my_profile(
         "is_active": current_user.is_active
     }
 
-# Maximum upload size: 5 MB
-MAX_FILE_SIZE = 5 * 1024 * 1024
 
-UPLOAD_DIR = Path(__file__).resolve().parent / "storage" / "documents"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
+# -------------------------------
+# Upload Document
+# -------------------------------
 
 @app.post("/documents/upload")
 async def upload_document(
@@ -141,7 +197,12 @@ async def upload_document(
         ".png": ("image/png", b"\x89PNG\r\n\x1a\n")
     }
 
-    original_name = (file.filename or "").replace("\\", "/").split("/")[-1]
+    original_name = (
+        (file.filename or "")
+        .replace("\\", "/")
+        .split("/")[-1]
+    )
+
     extension = Path(original_name).suffix.lower()
 
     if extension not in allowed_types:
@@ -202,8 +263,10 @@ async def upload_document(
 
     except Exception:
         db.rollback()
+
         if file_path.exists():
             file_path.unlink()
+
         raise HTTPException(
             status_code=500,
             detail="Document upload failed"
@@ -215,6 +278,12 @@ async def upload_document(
         "filename": document.filename,
         "file_size": document.file_size
     }
+
+
+# -------------------------------
+# List User Documents
+# -------------------------------
+
 @app.get("/documents")
 def list_documents(
     current_user: User = Depends(get_current_user),
@@ -222,7 +291,9 @@ def list_documents(
 ):
     documents = db.query(Document).filter(
         Document.owner_id == current_user.id
-    ).order_by(Document.uploaded_at.desc()).all()
+    ).order_by(
+        Document.uploaded_at.desc()
+    ).all()
 
     return [
         {
@@ -234,6 +305,11 @@ def list_documents(
         }
         for doc in documents
     ]
+
+
+# -------------------------------
+# Download Document
+# -------------------------------
 
 @app.get("/documents/{document_id}/download")
 def download_document(
@@ -267,6 +343,7 @@ def download_document(
         resource_id=document.id,
         details="Document downloaded"
     ))
+
     db.commit()
 
     return FileResponse(
@@ -274,6 +351,11 @@ def download_document(
         media_type=document.content_type,
         filename=document.filename
     )
+
+
+# -------------------------------
+# Delete Document
+# -------------------------------
 
 @app.delete("/documents/{document_id}")
 def delete_document(
@@ -312,6 +394,12 @@ def delete_document(
         "message": "Document deleted successfully",
         "document_id": document_id
     }
+
+
+# -------------------------------
+# Admin - View All Users
+# -------------------------------
+
 @app.get("/admin/users")
 def get_all_users(
     admin: User = Depends(get_current_admin),
@@ -329,6 +417,12 @@ def get_all_users(
         }
         for user in users
     ]
+
+
+# -------------------------------
+# Admin - Activate / Deactivate
+# -------------------------------
+
 @app.put("/admin/users/{user_id}/status")
 def update_user_status(
     user_id: int,
@@ -336,7 +430,9 @@ def update_user_status(
     admin: User = Depends(get_current_admin),
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(
+        User.id == user_id
+    ).first()
 
     if not user:
         raise HTTPException(
@@ -368,6 +464,12 @@ def update_user_status(
         "user_id": user.id,
         "is_active": user.is_active
     }
+
+
+# -------------------------------
+# Admin - View Audit Logs
+# -------------------------------
+
 @app.get("/admin/audit-logs")
 def get_audit_logs(
     admin: User = Depends(get_current_admin),
