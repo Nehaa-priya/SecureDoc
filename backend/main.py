@@ -1,4 +1,6 @@
-
+import io
+import logging
+logger = logging.getLogger(__name__)
 import os
 import time
 import urllib.request
@@ -187,6 +189,8 @@ def get_my_profile(
 # Upload Document to Cloudinary
 # -------------------------------
 
+
+
 @app.post("/documents/upload")
 async def upload_document(
     file: UploadFile = File(...),
@@ -247,11 +251,11 @@ async def upload_document(
         )
 
     public_id = f"securedoc/{uuid4().hex}{extension}"
-    uploaded = False
+    stored_name = None
 
     try:
         result = cloudinary.uploader.upload(
-            content,
+            io.BytesIO(content),
             public_id=public_id,
             resource_type="raw",
             type="authenticated",
@@ -259,7 +263,6 @@ async def upload_document(
         )
 
         stored_name = result["public_id"]
-        uploaded = True
 
         document = Document(
             filename=original_name,
@@ -283,10 +286,12 @@ async def upload_document(
         db.commit()
         db.refresh(document)
 
-    except Exception:
+    except Exception as e:
         db.rollback()
 
-        if uploaded:
+        logger.exception("Cloudinary document upload failed")
+
+        if stored_name:
             try:
                 cloudinary.uploader.destroy(
                     stored_name,
@@ -295,11 +300,11 @@ async def upload_document(
                     invalidate=True
                 )
             except Exception:
-                pass
+                logger.exception("Cloudinary cleanup failed")
 
         raise HTTPException(
             status_code=500,
-            detail="Document upload failed. Check Cloudinary configuration."
+            detail="Document upload failed. Check backend logs."
         )
 
     return {
